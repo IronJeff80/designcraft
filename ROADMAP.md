@@ -11,6 +11,14 @@
 
 DesignCraft aims at full Adobe InDesign parity — and to be better: faster, open (documented JSON format + IDML), scriptable by agents (MCP), and available on the web.
 
+- **2026-10-23** · PDF layer choices now validate before editing all targets; rejected rewrites
+  leave document/undo state intact. Null trailer entries remain unencrypted, and unsupported
+  all-content crops retain the whole page rather than silently clipping hidden layers.
+- **2026-10-23** · PDF layer visibility variants retain catalog/configuration entries and full
+  object references; bounded incremental updates replace the existing catalog. Synthetic
+  regression tests cover metadata, output-intent references, nonzero generations and
+  forward Prev links; repeated cross-reference offsets are rejected explicitly. No readiness percentage change.
+
 ## Status (2026-10-01)
 
 **Working today**
@@ -350,6 +358,7 @@ list) · [roadmap.md](docs/roadmap.md) (milestones, plan) · [parity-checklist.m
 
 Newest first.
 
+- **2026-10-24** · Custom-positioned anchored objects honour Relative to Spine (`anchored.options {spineRelative}`, IDML `SpineRelative`): the settings describe a left-hand page and mirror on a right-hand page, so marginal notes stay in the outside margin on both pages of a spread. On right-hand pages they took the left-hand placement and landed in the inside margin, across the spine or over the body text. No readiness percentage change.
 - **2026-10-23** · Save and export dialogs (Save As, Save a Copy, Export PDF and the other exports, Package, libraries and books) start in the active document's folder once it has been saved, and for a document never saved in the folder of the last file saved or exported, remembered across sessions (#1653). A folder deleted since falls back to the system's choice. No readiness percentage change.
 - **2026-10-22** · Autoflow (Shift-click with the loaded text cursor, autoflow on Place, `text.thread {autoflow}`) fills the pages that follow before it adds any, as InDesign does: one frame per column on each following page, whatever else the page holds, then new pages at the end of the document. It inserted pages right after the story's last frame, in front of the document's own pages. Frames it set past the end of the text go again; a page the document had stays, and a page autoflow added only for such a frame goes with it. Smart Text Reflow of the primary text frame is unchanged. No readiness percentage change.
 - **2026-10-16** · Edit › Keyboard Shortcuts imports a set saved by InDesign's Show Set (.txt, Windows or Mac key names, UTF-8 or UTF-16): matched commands take its Default shortcuts or lose theirs, other commands give up keys it takes, and a report lists what it changed and the items it could not match (`window.importShortcuts`, #1180). Tool keys stay fixed. No readiness percentage change.
