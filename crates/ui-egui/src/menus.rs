@@ -244,7 +244,12 @@ pub const UI_COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
         "{target?: workingCmyk|srgb|legacyMacRgb|monitorRgb|protanopia|deuteranopia|cmyk:<profile>, intent?, simulatePaper?: bool|\"toggle\"}",
     ),
     ("app.colorSettings", "Color Settings…", None, "{} — the working spaces, intent and black-point compensation"),
-    ("view.separations", "Separations Preview", None, "{plate?: cyan|magenta|yellow|black|null, inkLimit?: percent|null}"),
+    (
+        "view.separations",
+        "Separations Preview",
+        None,
+        "{on?: bool, plate?: all|cyan|magenta|yellow|black|spot ink name|null (null: all inks, and off unless an ink limit stays), inkLimit?: percent|null} — the plates of the PDF Export PDF writes → {on, plate, inkLimit, spread, inks: [{name, spot}], dpi, warning?, error?}",
+    ),
     ("view.overprintPreview", "Overprint Preview", Some("Cmd+Alt+Shift+Y"), "{} — show how overprinting inks mix"),
     ("view.fastDisplay", "Fast Display", Some("Cmd+Alt+Shift+Z"), "{} — placed graphics as grey boxes, no effects"),
     ("view.typicalDisplay", "Typical Display", Some("Cmd+Alt+Z"), "{} — low-resolution image proxies"),
@@ -838,6 +843,7 @@ pub const MENUS: &[(&str, &[&str])] = &[
             "ui:view.proofColors",
             ">Separations Preview",
             "ui:view.separations|Off|{\"plate\": null, \"inkLimit\": null}",
+            "ui:view.separations|All Inks|{\"plate\": \"all\"}",
             "ui:view.separations|Cyan|{\"plate\": \"cyan\"}",
             "ui:view.separations|Magenta|{\"plate\": \"magenta\"}",
             "ui:view.separations|Yellow|{\"plate\": \"yellow\"}",
@@ -945,6 +951,7 @@ pub const MENUS: &[(&str, &[&str])] = &[
             ">Output",
             "ui:window.panel|Attributes|{\"panel\": \"attributes\"}",
             "ui:window.panel|Preflight|{\"panel\": \"preflight\"}",
+            "ui:window.panel|Separations Preview|{\"panel\": \"separations\"}",
             "<",
             "ui:window.panel|Pages|{\"panel\": \"pages\"}",
             "ui:window.panel|Properties|{\"panel\": \"properties\"}",
@@ -1698,16 +1705,7 @@ fn run_ui_inner(app: &mut DesignApp, id: &str, p: &Value) -> Option<Result<Value
             app.ui.dialog = Some(crate::dialogs::Dialog::new("colorSettings", f));
             Ok(Value::Null)
         }
-        "view.separations" => {
-            if let Some(v) = p.get("plate") {
-                app.ui.separation = v.as_str().and_then(|s| ["cyan", "magenta", "yellow", "black"].iter().position(|x| *x == s)).map(|i| i as u8);
-            }
-            if let Some(v) = p.get("inkLimit") {
-                app.ui.ink_limit = v.as_f64().map(|l| (l / 100.0) as f32);
-            }
-            app.canvas.shown = None;
-            Ok(Value::Null)
-        }
+        "view.separations" => separations_view(app, p),
         "view.firstPage" | "view.previousPage" | "view.nextPage" | "view.lastPage" => {
             let n = app.session.active().map_or(0, |d| d.doc.page_count());
             if n > 0 {
@@ -2172,6 +2170,61 @@ fn export_bytes(app: &mut DesignApp, p: &Value, ext: &str, cmd: &str) -> Result<
     }
 }
 
+/// View › Separations Preview (`view.separations`): updates the plate and the ink limit and
+/// reports the plates of the spread nearest the view center.
+fn separations_view(app: &mut DesignApp, p: &Value) -> Result<Value, String> {
+    let mut sep = app.ui.separations.clone().unwrap_or_default();
+    let mut on = app.ui.separations.is_some();
+    match p.get("plate") {
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("all") || s.is_empty() => {
+            sep.plate = None;
+            on = true;
+        }
+        Some(Value::String(s)) => {
+            let process = ["Cyan", "Magenta", "Yellow", "Black"].into_iter().find(|n| n.eq_ignore_ascii_case(s));
+            sep.plate = Some(process.map_or_else(|| s.clone(), str::to_string));
+            on = true;
+        }
+        Some(Value::Null) => {
+            sep.plate = None;
+            on = false;
+        }
+        Some(v) => return Err(format!("`plate`: an ink name, \"all\" or null, not {v}")),
+        None => {}
+    }
+    match p.get("inkLimit") {
+        Some(Value::Null) => sep.ink_limit = None,
+        Some(v) => {
+            let l = v.as_f64().filter(|l| l.is_finite() && *l >= 0.0).ok_or_else(|| format!("`inkLimit`: a percentage, not {v}"))?;
+            sep.ink_limit = Some(l as f32);
+            on = true;
+        }
+        None => {}
+    }
+    on |= sep.ink_limit.is_some();
+    if let Some(v) = p.get("on").and_then(Value::as_bool) {
+        on = v;
+    }
+    app.ui.separations = on.then_some(sep.clone());
+    let mut out = json!({"on": on, "plate": sep.plate.as_deref().unwrap_or("all"), "inkLimit": sep.ink_limit});
+    if on && app.session.active().is_some() {
+        match crate::separations::current_sheet(app) {
+            Ok(sheet) => {
+                if let Some(name) = &sep.plate
+                    && sheet.ink(name).is_none()
+                {
+                    out["warning"] = json!(format!("this spread prints no `{name}` plate"));
+                }
+                out["spread"] = json!(sheet.spread);
+                out["dpi"] = json!(sheet.plates.dpi);
+                out["inks"] = sheet.inks().into_iter().map(|(name, spot)| json!({"name": name, "spot": spot})).collect();
+            }
+            Err(e) => out["error"] = json!(e),
+        }
+    }
+    Ok(out)
+}
+
 /// File › Export PDF…: ask for a path, export through `file.exportPdf` and write the bytes with the
 /// platform writer (a download on the web).
 pub(crate) fn export_pdf(app: &mut DesignApp, p: &Value) -> Result<Value, String> {
@@ -2492,6 +2545,16 @@ pub fn checked(app: &DesignApp, id: &str, params: &Value) -> Option<bool> {
         "view.rulers" => app.ui.rulers,
         "view.frameEdges" => app.ui.frame_edges,
         "view.overprintPreview" => app.ui.overprint_preview,
+        "view.separations" => {
+            let sep = app.ui.separations.as_ref();
+            match (params.get("plate"), params.get("inkLimit")) {
+                (Some(Value::Null), _) => sep.is_none(),
+                (Some(Value::String(s)), _) if s == "all" => sep.is_some_and(|x| x.plate.is_none()),
+                (Some(Value::String(s)), _) => sep.and_then(|x| x.plate.as_deref()).is_some_and(|p| p.eq_ignore_ascii_case(s)),
+                (None, Some(v)) => sep.and_then(|x| x.ink_limit).is_some_and(|l| Some(f64::from(l)) == v.as_f64()),
+                _ => false,
+            }
+        }
         "view.fastDisplay" => app.ui.display_quality == designcraft_render::DisplayQuality::Fast,
         "view.typicalDisplay" => app.ui.display_quality == designcraft_render::DisplayQuality::Typical,
         "view.highQualityDisplay" => app.ui.display_quality == designcraft_render::DisplayQuality::High,
@@ -3260,6 +3323,29 @@ fn keys_taken(app: &DesignApp, ctx: &egui::Context) -> bool {
         || crate::chrome::search_had_focus(ctx)
 }
 
+/// The command whose shortcut `key` with `modifiers` stands for, and whether the modifiers match
+/// that shortcut exactly.
+fn command_shortcut(app: &DesignApp, key: egui::Key, modifiers: egui::Modifiers, typing: bool) -> Option<(String, bool)> {
+    for (id, sc) in &effective_shortcuts(app) {
+        let id = id.as_str();
+        if let Some((m, k)) = parse_shortcut(sc)
+            && let Some(exact) = key_matches(m, k, key, modifiers)
+            && (m.command || m.alt || !typing)
+            && !(id == "edit.clear" && typing)
+        {
+            // Single-key shortcuts (W) only when not typing.
+            if !m.command && !m.alt && !m.shift && typing {
+                continue;
+            }
+            if id == "edit.clear" || (typing && matches!(id, "edit.copy" | "edit.cut" | "edit.paste" | "edit.pasteInPlace")) {
+                continue; // Handled by the active tool / text clipboard events.
+            }
+            return Some((id.to_string(), exact));
+        }
+    }
+    None
+}
+
 /// Runs the presentation key, command shortcut or tool shortcut a key press stands for. `consume`
 /// takes the press from the input where nothing else may see it. Returns whether the press was used.
 fn shortcut_key(app: &mut DesignApp, key: egui::Key, modifiers: egui::Modifiers, typing: bool, consume: &mut dyn FnMut()) -> bool {
@@ -3285,28 +3371,7 @@ fn shortcut_key(app: &mut DesignApp, key: egui::Key, modifiers: egui::Modifiers,
             return true;
         }
     }
-    // Command shortcuts.
-    let mut fired: Option<(String, bool)> = None;
-    let all = effective_shortcuts(app);
-    for (id, sc) in &all {
-        let id = id.as_str();
-        if let Some((m, k)) = parse_shortcut(sc)
-            && let Some(exact) = key_matches(m, k, key, modifiers)
-            && (m.command || m.alt || !typing)
-            && !(id == "edit.clear" && typing)
-        {
-            // Single-key shortcuts (W) only when not typing.
-            if !m.command && !m.alt && !m.shift && typing {
-                continue;
-            }
-            if id == "edit.clear" || (typing && matches!(id, "edit.copy" | "edit.cut" | "edit.paste" | "edit.pasteInPlace")) {
-                continue; // Handled by the active tool / text clipboard events.
-            }
-            fired = Some((id.to_string(), exact));
-            break;
-        }
-    }
-    if let Some((id, exact)) = fired {
+    if let Some((id, exact)) = command_shortcut(app, key, modifiers, typing) {
         // The native menu bar carries the shortcuts in effect, the user's included, and its
         // accelerator fires only for the shortcut's own key and modifiers; the Plus key standing
         // in for = never reaches it.

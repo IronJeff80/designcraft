@@ -629,6 +629,7 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
             painter.add(egui::Shape::mesh(mesh));
         }
     }
+    crate::separations::paint(app, ui.ctx(), &painter, &xf, &layout, screen);
     let hair = 1.0 / ui.ctx().pixels_per_point();
     for slot in &layout.slots {
         painter.rect_stroke(xf.rect(slot.bounds), 0.0, Stroke::new(hair, Color32::from_rgb(0x4a, 0x4a, 0x4a)), StrokeKind::Outside);
@@ -803,7 +804,6 @@ fn screen_options(app: &DesignApp, layout: &CanvasLayout, preview: bool, ppp: f6
         note_indicators: !preview && app.session.prefs.show_note_anchors,
         change_markup: !preview && app.session.prefs.show_added_text,
         tag_markers: !preview && app.ui.tag_markers,
-        plate: app.ui.separation,
         highlight_keeps: !preview && app.session.prefs.highlight_keeps,
         highlight_custom_tracking: !preview && app.session.prefs.highlight_custom_tracking,
         quality: app.ui.display_quality,
@@ -836,7 +836,6 @@ fn grid_areas(layout: &CanvasLayout) -> Vec<(designcraft_doc::SpreadRef, DRect)>
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DisplayKey {
     quality: designcraft_render::DisplayQuality,
-    separation: Option<u8>,
     rich_black: bool,
     overprint_preview: bool,
     proof_colors: bool,
@@ -854,7 +853,6 @@ fn display_key(app: &DesignApp) -> DisplayKey {
     let (ui, prefs) = (&app.ui, &app.session.prefs);
     DisplayKey {
         quality: ui.display_quality,
-        separation: ui.separation,
         rich_black: ui.rich_black,
         overprint_preview: ui.overprint_preview,
         proof_colors: ui.proof_colors,
@@ -1063,10 +1061,6 @@ fn upload(app: &mut DesignApp, ctx: &egui::Context, mut img: designcraft_render:
     if app.ui.proof_colors {
         designcraft_render::proof_view(&mut img, &app.ui.proof_setup);
     }
-    // Plates render from source colours; the ink limit is estimated from the composite.
-    if app.ui.separation.is_none() && app.ui.ink_limit.is_some() {
-        designcraft_render::separation_view(&mut img, None, app.ui.ink_limit);
-    }
     let ci = egui::ColorImage::from_rgba_premultiplied([img.width as usize, img.height as usize], &img.pixels);
     let ci = crate::widgets::fit_texture(ci, ctx.input(|i| i.max_texture_side));
     match &mut app.canvas.texture {
@@ -1107,104 +1101,153 @@ fn shown_area(app: &DesignApp, doc: &Document, xf: &Xf, slot: &SpreadSlot) -> Re
 
 /// `moving`: guides being dragged, drawn where they would be dropped instead of where they are.
 fn draw_guides(app: &DesignApp, painter: &egui::Painter, xf: &Xf, doc: &Document, layout: &CanvasLayout, t: &Tokens, moving: Option<&MovingGuides>) {
-    let s = &doc.settings;
     let selection: std::collections::HashSet<GuideSel> =
         app.session.active().map(|st| st.selection.guides.iter().copied().collect()).unwrap_or_default();
     for slot in &layout.slots {
         let Some(sp) = doc.spread(slot.spread) else { continue };
-        // Everything below is in spread coordinates, placed through the slot (which may be turned).
-        let m = slot.xf;
-        let pt = |p: Point| xf.to_screen(m * p);
-        let rect = |r: DRect| xf.rect(m.transform_rect_bbox(r));
-        // Bleed, then slug: one rectangle each around the spread (the inside offset only applies
-        // at the spread's outer edges).
         if app.ui.guides {
-            for (r, color) in [(sp.bleed_rect(s.bleed), s.bleed_color), (sp.slug_rect(s.slug), s.slug_color)] {
-                if let Some(r) = r {
-                    painter.rect_stroke(rect(r), 0.0, Stroke::new(hair(painter), c32(color)), StrokeKind::Middle);
-                }
-            }
+            draw_bleed_and_slug(painter, xf, doc, slot, sp);
         }
-        let pasteboard = m.inverse().transform_rect_bbox(layout.pasteboard);
+        let pasteboard = slot.xf.inverse().transform_rect_bbox(layout.pasteboard);
         for (pi, p) in sp.pages.iter().enumerate() {
             let pr = p.bounds();
-            // Page tool › Show Parent Page Overlay: the parent page's size over the page.
-            if p.show_parent_overlay
-                && let SpreadRef::Doc(si) = slot.spread
-                && let Some((ppi, ppg)) = doc.parent_page_for(doc.first_page_of_spread(si) + pi)
-                && let Some(pp) = doc.parents.get(ppi).and_then(|ps| ps.pages.get(ppg))
-            {
-                let r = rect(DRect::new(pr.x0, pr.y0, pr.x0 + pp.width, pr.y0 + pp.height));
-                painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(110, 110, 230, 28));
-                painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_rgb(110, 110, 230)), StrokeKind::Middle);
-            }
+            draw_parent_overlay(painter, xf, doc, slot, pi, p, pr);
             if !app.ui.guides {
                 continue;
             }
-            // Baseline grid.
-            if app.ui.baseline_grid && xf.zoom >= s.baseline_grid.view_threshold {
-                let g = &s.baseline_grid;
-                for y in baseline_grid_lines(g.origin(p), g.increment, p.height) {
-                    painter.line_segment(
-                        [pt(Point::new(pr.x0, pr.y0 + y)), pt(Point::new(pr.x1, pr.y0 + y))],
-                        Stroke::new(hair(painter), c32(g.color).gamma_multiply(0.8)),
-                    );
-                }
-            }
-            // Margins (magenta) and columns (violet).
-            painter.rect_stroke(rect(p.margin_rect()), 0.0, Stroke::new(hair(painter), c32(s.margin_color)), StrokeKind::Middle);
-            let cols = p.column_rects();
-            if cols.len() > 1 {
-                for (i, c) in cols.iter().enumerate() {
-                    let col = Stroke::new(hair(painter), c32(s.column_color));
-                    if i > 0 {
-                        painter.line_segment([pt(Point::new(c.x0, c.y0)), pt(Point::new(c.x0, c.y1))], col);
-                    }
-                    if i + 1 < cols.len() {
-                        painter.line_segment([pt(Point::new(c.x1, c.y0)), pt(Point::new(c.x1, c.y1))], col);
-                    }
-                }
-            }
-            // The page's own guides, then those it shows from its parent page. Selected guides are
-            // drawn thicker, in their layer's color.
-            let own = p.guides.len();
-            for (gi, mut g) in p.guides.iter().cloned().chain(doc.parent_guides(p)).enumerate().filter(|(_, g)| g.visible_in(doc)) {
-                let key = GuideSel { spread: slot.spread, page: pi, index: gi };
-                let selected = gi < own && selection.contains(&key);
-                if gi < own
-                    && let Some(m) = moving
-                    && m.guides.contains(&key)
-                {
-                    g.position += match g.orientation {
-                        designcraft_doc::Orientation::Vertical => m.dx,
-                        designcraft_doc::Orientation::Horizontal => m.dy,
-                    };
-                }
-                // Spread guides cross the pasteboard; page guides their page.
-                let span = if g.spread { pasteboard } else { pr };
-                let (a, bb) = match g.orientation {
-                    designcraft_doc::Orientation::Horizontal => (Point::new(span.x0, g.position), Point::new(span.x1, g.position)),
-                    designcraft_doc::Orientation::Vertical => {
-                        let span = if g.spread { sp.bounds().inflate(0.0, 36.0) } else { pr };
-                        (Point::new(g.position, span.y0), Point::new(g.position, span.y1))
-                    }
-                };
-                let stroke = if selected {
-                    let color = g.layer.and_then(|l| doc.layer(l)).map_or(Color32::from_rgb(79, 153, 255), |l| c32(l.color));
-                    Stroke::new(2.0, color)
-                } else {
-                    Stroke::new(hair(painter), Color32::from_rgb(74, 227, 255))
-                };
-                if g.liquid {
-                    // Liquid guides are dashed.
-                    painter.extend(egui::Shape::dashed_line(&[pt(a), pt(bb)], stroke, 6.0, 3.0));
-                } else {
-                    painter.line_segment([pt(a), pt(bb)], stroke);
-                }
-            }
+            draw_page_grids(painter, xf, doc, slot, p, pr, app.ui.baseline_grid);
+            draw_page_guides(painter, xf, doc, slot, sp, pi, p, pr, pasteboard, moving, &selection);
         }
     }
     let _ = t;
+}
+
+/// The bleed and slug outlines of a spread, in their own colours.
+fn draw_bleed_and_slug(painter: &egui::Painter, xf: &Xf, doc: &Document, slot: &SpreadSlot, sp: &designcraft_doc::Spread) {
+    let s = &doc.settings;
+    let rect = |r: DRect| xf.rect(slot.xf.transform_rect_bbox(r));
+    // Bleed, then slug: one rectangle each around the spread (the inside offset only applies
+    // at the spread's outer edges).
+    for (r, color) in [(sp.bleed_rect(s.bleed), s.bleed_color), (sp.slug_rect(s.slug), s.slug_color)] {
+        if let Some(r) = r {
+            painter.rect_stroke(rect(r), 0.0, Stroke::new(hair(painter), c32(color)), StrokeKind::Middle);
+        }
+    }
+}
+
+/// Page tool › Show Parent Page Overlay: the parent page's size over the page.
+fn draw_parent_overlay(painter: &egui::Painter, xf: &Xf, doc: &Document, slot: &SpreadSlot, pi: usize, p: &designcraft_doc::Page, pr: DRect) {
+    let rect = |r: DRect| xf.rect(slot.xf.transform_rect_bbox(r));
+    if p.show_parent_overlay
+        && let SpreadRef::Doc(si) = slot.spread
+        && let Some((ppi, ppg)) = doc.parent_page_for(doc.first_page_of_spread(si) + pi)
+        && let Some(pp) = doc.parents.get(ppi).and_then(|ps| ps.pages.get(ppg))
+    {
+        let r = rect(DRect::new(pr.x0, pr.y0, pr.x0 + pp.width, pr.y0 + pp.height));
+        painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(110, 110, 230, 28));
+        painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_rgb(110, 110, 230)), StrokeKind::Middle);
+    }
+}
+
+/// A page's baseline grid (when `baseline` is on and the view is zoomed in far enough), margins
+/// and columns.
+fn draw_page_grids(painter: &egui::Painter, xf: &Xf, doc: &Document, slot: &SpreadSlot, p: &designcraft_doc::Page, pr: DRect, baseline: bool) {
+    let s = &doc.settings;
+    let pt = |q: Point| xf.to_screen(slot.xf * q);
+    let rect = |r: DRect| xf.rect(slot.xf.transform_rect_bbox(r));
+    // Baseline grid.
+    if baseline && xf.zoom >= s.baseline_grid.view_threshold {
+        let g = &s.baseline_grid;
+        for y in baseline_grid_lines(g.origin(p), g.increment, p.height) {
+            painter.line_segment(
+                [pt(Point::new(pr.x0, pr.y0 + y)), pt(Point::new(pr.x1, pr.y0 + y))],
+                Stroke::new(hair(painter), c32(g.color).gamma_multiply(0.8)),
+            );
+        }
+    }
+    // Margins (magenta) and columns (violet).
+    painter.rect_stroke(rect(p.margin_rect()), 0.0, Stroke::new(hair(painter), c32(s.margin_color)), StrokeKind::Middle);
+    let cols = p.column_rects();
+    if cols.len() > 1 {
+        for (i, c) in cols.iter().enumerate() {
+            let col = Stroke::new(hair(painter), c32(s.column_color));
+            if i > 0 {
+                painter.line_segment([pt(Point::new(c.x0, c.y0)), pt(Point::new(c.x0, c.y1))], col);
+            }
+            if i + 1 < cols.len() {
+                painter.line_segment([pt(Point::new(c.x1, c.y0)), pt(Point::new(c.x1, c.y1))], col);
+            }
+        }
+    }
+}
+
+/// The page's own guides, then those it shows from its parent page. `moving` draws dragged
+/// guides where they would be dropped.
+fn draw_page_guides(
+    painter: &egui::Painter,
+    xf: &Xf,
+    doc: &Document,
+    slot: &SpreadSlot,
+    sp: &designcraft_doc::Spread,
+    pi: usize,
+    p: &designcraft_doc::Page,
+    pr: DRect,
+    pasteboard: DRect,
+    moving: Option<&MovingGuides>,
+    selection: &std::collections::HashSet<GuideSel>,
+) {
+    let own = p.guides.len();
+    for (gi, mut g) in p.guides.iter().cloned().chain(doc.parent_guides(p)).enumerate().filter(|(_, g)| g.visible_in(doc)) {
+        let key = GuideSel { spread: slot.spread, page: pi, index: gi };
+        // Selected guides are drawn thicker, in their layer's color.
+        let selected = gi < own && selection.contains(&key);
+        if gi < own
+            && let Some(m) = moving
+            && m.guides.contains(&key)
+        {
+            g.position += match g.orientation {
+                designcraft_doc::Orientation::Vertical => m.dx,
+                designcraft_doc::Orientation::Horizontal => m.dy,
+            };
+        }
+        draw_guide(painter, xf, doc, slot, sp, pr, pasteboard, &g, selected);
+    }
+}
+
+/// One guide as a line: across the pasteboard for a spread guide, across its page otherwise.
+fn draw_guide(
+    painter: &egui::Painter,
+    xf: &Xf,
+    doc: &Document,
+    slot: &SpreadSlot,
+    sp: &designcraft_doc::Spread,
+    pr: DRect,
+    pasteboard: DRect,
+    g: &designcraft_doc::Guide,
+    selected: bool,
+) {
+    let pt = |q: Point| xf.to_screen(slot.xf * q);
+    // Spread guides cross the pasteboard; page guides their page.
+    let span = if g.spread { pasteboard } else { pr };
+    let (a, bb) = match g.orientation {
+        designcraft_doc::Orientation::Horizontal => (Point::new(span.x0, g.position), Point::new(span.x1, g.position)),
+        designcraft_doc::Orientation::Vertical => {
+            let span = if g.spread { sp.bounds().inflate(0.0, 36.0) } else { pr };
+            (Point::new(g.position, span.y0), Point::new(g.position, span.y1))
+        }
+    };
+    let stroke = if selected {
+        let color = g.layer.and_then(|l| doc.layer(l)).map_or(Color32::from_rgb(79, 153, 255), |l| c32(l.color));
+        Stroke::new(2.0, color)
+    } else {
+        Stroke::new(hair(painter), Color32::from_rgb(74, 227, 255))
+    };
+    if g.liquid {
+        // Liquid guides are dashed.
+        painter.extend(egui::Shape::dashed_line(&[pt(a), pt(bb)], stroke, 6.0, 3.0));
+    } else {
+        painter.line_segment([pt(a), pt(bb)], stroke);
+    }
 }
 
 /// Spread-space → canvas transform for an item at `loc`.
@@ -2451,6 +2494,26 @@ fn scrollbar_rects(outer: Rect, screen: Rect, content: Rect, vertical: bool) -> 
     }
 }
 
+/// How far a scrollbar interaction pans the view along its axis: a thumb drag follows the pointer,
+/// a click on the track beside the thumb pages by one view.
+fn scrollbar_move(resp: &egui::Response, grabbed: bool, vertical: bool, thumb: Rect, page: f32, k: f32) -> f32 {
+    if grabbed {
+        let d = resp.drag_delta();
+        return -(if vertical { d.y } else { d.x }) * k;
+    }
+    if resp.clicked()
+        && let Some(p) = resp.interact_pointer_pos()
+    {
+        let (p, a, b) = if vertical { (p.y, thumb.min.y, thumb.max.y) } else { (p.x, thumb.min.x, thumb.max.x) };
+        if p < a {
+            return page;
+        } else if p > b {
+            return -page;
+        }
+    }
+    0.0
+}
+
 /// The view's scrollbars, on the right and bottom edges of `outer`: they span the pasteboard;
 /// dragging a thumb pans, clicking the track pages by one view.
 fn scrollbars(app: &mut DesignApp, ui: &mut egui::Ui, outer: Rect, screen: Rect, rect: Rect, t: &Tokens) {
@@ -2476,21 +2539,8 @@ fn scrollbars(app: &mut DesignApp, ui: &mut egui::Ui, outer: Rect, screen: Rect,
         if !resp.dragged() {
             ui.data_mut(|d| d.remove::<bool>(grab_id));
         }
-        let along = |p: egui::Vec2| if vertical { p.y } else { p.x };
-        let page = along(screen.size());
-        let mut moved = 0.0;
-        if grabbed {
-            moved = -along(resp.drag_delta()) * k;
-        } else if resp.clicked()
-            && let Some(p) = resp.interact_pointer_pos()
-        {
-            let (p, a, b) = if vertical { (p.y, thumb.min.y, thumb.max.y) } else { (p.x, thumb.min.x, thumb.max.x) };
-            if p < a {
-                moved = page;
-            } else if p > b {
-                moved = -page;
-            }
-        }
+        let page = if vertical { screen.size().y } else { screen.size().x };
+        let moved = scrollbar_move(&resp, grabbed, vertical, thumb, page, k);
         if moved != 0.0 && moved.is_finite() {
             pan(app, &xf, if vertical { vec2(0.0, moved) } else { vec2(moved, 0.0) });
         }
@@ -3686,6 +3736,37 @@ fn guide_at(app: &DesignApp, xf: &Xf, p: Pos2) -> Option<(designcraft_doc::Sprea
     None
 }
 
+/// A primary press at `o` on a ruler starts a new guide; on a guide it selects and grabs it.
+fn begin_guide_drag(app: &mut DesignApp, ui: &mut egui::Ui, resp: &egui::Response, rect: Rect, xf: &Xf, o: Pos2) -> Option<GuideDrag> {
+    let full = resp.rect;
+    if full.contains(o) && !rect.contains(o) {
+        // In a ruler (not the corner).
+        let orientation = if o.y < rect.min.y && o.x >= rect.min.x {
+            Some(designcraft_doc::Orientation::Horizontal)
+        } else if o.x < rect.min.x && o.y >= rect.min.y {
+            Some(designcraft_doc::Orientation::Vertical)
+        } else {
+            None
+        };
+        if let Some(orientation) = orientation {
+            return Some(GuideDrag { orientation, from: None, at: Some(o), mods: egui::Modifiers::NONE });
+        }
+    } else if rect.contains(o)
+        && matches!(app.session.tool_id(), "selection" | "directSelection")
+        && let Some((r, pi, gi, orientation)) = guide_at(app, xf, o)
+    {
+        let shift = ui.input(|i| i.modifiers.shift);
+        // A press on a guide selects it (Shift: on release, as a click adds or removes it).
+        let selected = app.session.active().is_some_and(|st| st.selection.guides.contains(&GuideSel { spread: r, page: pi, index: gi }));
+        if !shift && !selected {
+            let _ = app.run("guide.select", json!({"spread": r, "page": pi, "index": gi}));
+        }
+        ui.data_mut(|d| d.insert_temp(egui::Id::unique(GUIDE_PRESS), GuidePress { origin: o, shift }));
+        return Some(GuideDrag { orientation, from: Some((r, pi, gi)), at: Some(o), mods: egui::Modifiers::NONE });
+    }
+    None
+}
+
 /// Ruler guides: drag one out of a ruler, drag an existing one (Selection tools) to move it, drop
 /// it back on a ruler to delete it. A press near an unlocked guide takes it even over an object:
 /// the guide is selected and the object is not. Returns true from the press to the release, so
@@ -3697,32 +3778,7 @@ fn guide_drag(app: &mut DesignApp, ui: &mut egui::Ui, resp: &egui::Response, rec
     let mut drag: Option<GuideDrag> = ui.data(|d| d.get_temp(id));
     if drag.is_none() && pressed && resp.hovered() && app.ui.guides && !app.ui.guides_locked {
         let Some(o) = origin else { return false };
-        let full = resp.rect;
-        if full.contains(o) && !rect.contains(o) {
-            // In a ruler (not the corner).
-            let orientation = if o.y < rect.min.y && o.x >= rect.min.x {
-                Some(designcraft_doc::Orientation::Horizontal)
-            } else if o.x < rect.min.x && o.y >= rect.min.y {
-                Some(designcraft_doc::Orientation::Vertical)
-            } else {
-                None
-            };
-            if let Some(orientation) = orientation {
-                drag = Some(GuideDrag { orientation, from: None, at: Some(o), mods: egui::Modifiers::NONE });
-            }
-        } else if rect.contains(o)
-            && matches!(app.session.tool_id(), "selection" | "directSelection")
-            && let Some((r, pi, gi, orientation)) = guide_at(app, xf, o)
-        {
-            let shift = ui.input(|i| i.modifiers.shift);
-            // A press on a guide selects it (Shift: on release, as a click adds or removes it).
-            let selected = app.session.active().is_some_and(|st| st.selection.guides.contains(&GuideSel { spread: r, page: pi, index: gi }));
-            if !shift && !selected {
-                let _ = app.run("guide.select", json!({"spread": r, "page": pi, "index": gi}));
-            }
-            ui.data_mut(|d| d.insert_temp(egui::Id::unique(GUIDE_PRESS), GuidePress { origin: o, shift }));
-            drag = Some(GuideDrag { orientation, from: Some((r, pi, gi)), at: Some(o), mods: egui::Modifiers::NONE });
-        }
+        drag = begin_guide_drag(app, ui, resp, rect, xf, o);
     }
     let Some(mut g) = drag else { return false };
     if let Some(p) = latest {
